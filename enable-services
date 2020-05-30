@@ -10,5 +10,4 @@ services="xenstored.service xenconsoled.service xendomains.service xen-init-dom0
 for service in $services; do
     systemctl enable $service
     systemctl start $service
-    systemctl status $service
 done

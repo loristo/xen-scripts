@@ -1,5 +1,7 @@
 #!/bin/sh
 
+set -e
+
 if [ "$UID" -ne 0 ]; then
     echo run as root
     exit 1
