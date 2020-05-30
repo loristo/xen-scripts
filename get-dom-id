@@ -1,0 +1,15 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo usage: get-dom-id DOMAIN
+    exit 1
+fi
+
+DOMAIN="$1"
+
+xl list  | grep "$DOMAIN"  | sed 's/'"$DOMAIN"' *\([0-9]\+\).*/\1/'

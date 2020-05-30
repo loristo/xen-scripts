@@ -1,0 +1,14 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo usage: format-disks vm-name
+    exit 1
+fi
+
+mkfs.ext4 "/dev/vg0/$1-disk"
+mkfs.fat -F32 "/dev/vg0/$1-boot"

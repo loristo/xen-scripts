@@ -1,0 +1,14 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+services="xenstored.service xenconsoled.service xendomains.service xen-init-dom0.service"
+
+for service in $services; do
+    systemctl enable $service
+    systemctl start $service
+    systemctl status $service
+done

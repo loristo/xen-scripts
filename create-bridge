@@ -1,0 +1,16 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+bridge="xenbr0"
+interface="eno1"
+
+ip link add name "$bridge" type bridge
+ip link set "$bridge" up
+ip link set "$interface" up
+ip link set "$interface" master "$bridge"
+dhcpcd "$bridge"
+# ip addr add dev "$bridge" 192.168.0.128/24

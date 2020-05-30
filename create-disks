@@ -1,0 +1,14 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 2 ]; then
+    echo usage: create-disks vm-name disk-size
+    exit 1
+fi
+
+lvcreate -n "$1-disk"  -L "$2" vg0
+lvcreate -n "$1-boot"  -L 220M vg0

@@ -1,0 +1,14 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo usage: create-disks vm-name
+    exit 1
+fi
+
+lvremove "/dev/vg0/$1-disk"
+lvremove "/dev/vg0/$1-boot"

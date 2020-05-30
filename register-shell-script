@@ -1,0 +1,16 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 2 ]; then
+    echo usage: register-shell-script DOMAIN SCRIPT
+    exit 1
+fi
+
+DOMAIN="$1"
+SCRIPT="$2"
+
+xenstore-write /local/domain/$(get-dom-id $DOMAIN)/script "$(cat $SCRIPT)"

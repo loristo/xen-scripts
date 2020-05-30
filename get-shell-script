@@ -1,0 +1,13 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 0 ]; then
+    echo usage: get-shell-script
+    exit 1
+fi
+
+xenstore-read /local/domain/$(xenstore-read domid)/script | sed 's/\\n/\n/g' > script && chmod 755 script
