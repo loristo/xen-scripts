@@ -12,6 +12,61 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
+getInterfaceAttribute() {
+    ATTRIBUTE=$(xmllint --xpath '/topology/interfaces/interface['"$1"']/@'"$2"'' $FILE 2>/dev/null \
+            | sed 's/.*'"$2"'="\(.*\)".*/\1/')
+}
+
+bridgeCleanup() {
+    for bridge in $(ls /etc/netctl/bridge-* 2>/dev/null); do
+        B="$(echo "$bridge" | sed 's/.*\/bridge-\(.*\)/\1/')"
+        systemctl disable "dhcpcd@$B"
+        netctl disable "bridge-$B"
+        rm "$bridge"
+    done
+}
+
+switchCleanup() {
+    for switch in $(sudo ovs-vsctl show | grep Bridge | sed 's/.*Bridge \(.*\)/\1/'); do
+        ovs-vsctl del-br "$switch"
+    done
+}
+
+bridge() {
+    i="$1"
+    getInterfaceAttribute $i "name"
+    NAME="$ATTRIBUTE"
+    if [[ "$NAME" == "" ]]; then
+        echo "!! No interface name" 1>&2
+        exit 1
+    fi
+    getInterfaceAttribute $i "phys"
+    PHYS="$ATTRIBUTE"
+    if [[ "$IS_DHCP" == "" ]]; then
+        getInterfaceAttribute $i "ip"
+        IP="$ATTRIBUTE"
+        getInterfaceAttribute $i "gateway"
+        GATEWAY="$ATTRIBUTE"
+        getInterfaceAttribute $i "dns"
+        DNS="$ATTRIBUTE"
+        create-bridge "$NAME" "$PHYS" "$IP" "$GATEWAY" "$DNS"
+    else
+        create-bridge "$NAME" "$PHYS"
+    fi
+}
+
+switch() {
+    i="$1"
+    getInterfaceAttribute $i "name"
+    NAME="$ATTRIBUTE"
+    ovs-vsctl add-br "$NAME"
+    getInterfaceAttribute $i "phys"
+    PHYS="$ATTRIBUTE"
+    for phy in $PHYS; do
+        ovs-vsctl add-port "$NAME" "$phy"
+    done
+}
+
 FILE="$1"
 NBINTERFACES=$(xmllint --xpath "count(/topology/interfaces/interface)" $FILE)
 NBVMS=$(xmllint --xpath "count(/topology/vms/vm)" $FILE)
@@ -20,17 +75,21 @@ echo "- Interfaces: $NBINTERFACES"
 echo "- VMS: $NBVMS"
 echo
 
+echo "--- CLEANING INTERFACES ---"
+bridgeCleanup
+switchCleanup
+
 echo "--- CREATING INTERFACES ---"
 
 for i in $(seq $NBINTERFACES); do
-    TYPE=$(xmllint --xpath '/topology/interfaces/interface['"$i"']/@type' $FILE \
-            | sed 's/.*type="\(.*\)".*/\1/')
+    getInterfaceAttribute $i "type"
+    TYPE="$ATTRIBUTE"
     case $TYPE in
         bridge)
-            echo "Hello, I am a bridge"
+            bridge "$i"
             ;;
         switch)
-            echo "Hello, I am a switch"
+            switch "$i"
             ;;
         *)
             echo "!! Unknown interface type: $TYPE" 1>&2
@@ -38,3 +97,6 @@ for i in $(seq $NBINTERFACES); do
             ;;
     esac
 done
+
+echo "--- CREATING VMS ---"
+
