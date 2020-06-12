@@ -13,4 +13,3 @@ if [ "$#" -ne 1 ]; then
 fi
 
 lvremove "/dev/vg0/$1-disk"
-lvremove "/dev/vg0/$1-boot"
