@@ -7,12 +7,44 @@ if [ "$UID" -ne 0 ]; then
     exit 1
 fi
 
-bridge="xenbr0"
-interface="eno1"
+if [ "$#" -ne 2 ] && [ "$#" -le 4 ]; then
+    echo usage: create-bridge name interfaces [ ip default-gateway dns ]
+    exit 1
+fi
 
-ip link add name "$bridge" type bridge
-ip link set "$bridge" up
-ip link set "$interface" up
-ip link set "$interface" master "$bridge"
-dhcpcd "$bridge"
-# ip addr add dev "$bridge" 192.168.0.128/24
+NAME="$1"
+PHYS="$2"
+
+cat >> /etc/netctl/bridge-$NAME <<EOF
+Description="$NAME Bridge connection"
+Interface=$NAME
+Connection=bridge
+BindsToInterfaces=($PHYS)
+## Use the MAC address of eth1 (may also be set to a literal MAC address)
+#MACAddress=eth1
+IP=dhcp
+## Ignore (R)STP and immediately activate the bridge
+#SkipForwardingDelay=yes c'est wow de ouf
+EOF
+
+netctl enable "bridge-$NAME"
+netctl start "bridge-$NAME"
+
+cat /etc/dhcpcd.conf | sed '/'"$NAME"'/d' > /etc/dhcpcd.conf.new
+mv /etc/dhcpcd.conf.new /etc/dhcpcd.conf
+
+if [ "$#" -ne 2 ]; then
+    IP="$3"
+    GATEWAY="$4"
+    DNS="$5"
+    cat >> /etc/dhcpcd.conf <<EOF
+# define static route $NAME
+interface $NAME # $NAME
+static ip_address=$IP # $NAME
+static routers=$GATEWAY # $NAME
+static domain_name_servers=$DNS # $NAME
+EOF
+fi
+
+systemctl enable "dhcpcd@$NAME"
+systemctl start "dhcpcd@$NAME"
