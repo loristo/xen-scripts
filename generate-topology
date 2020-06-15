@@ -12,9 +12,72 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
+generateVM() {
+    NAME="$1"
+    MEMORY="$2"
+    MAX_MEMORY="$3"
+    VCPUS="$4"
+    INTERFACES="$5"
+    DISKS="$6"
+    cat <<EOF
+# =====================================================================
+# $NAME HVM guest configuration
+# =====================================================================
+#
+# This is a fairly minimal example of what is required for an
+# HVM guest. For a more complete guide see xl.cfg(5)
+
+# This configures an HVM rather than PV guest
+type = "hvm"
+builder = "hvm"
+
+# Guest name
+name = "$NAME"
+
+# 128-bit UUID for the domain as a hexadecimal number.
+# Use "uuidgen" to generate one if required.
+# The default behavior is to generate a new UUID each time the guest is started.
+#uuid = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+
+# Enable Microsoft Hyper-V compatibile paravirtualisation /
+# enlightenment interfaces. Turning this on can improve Windows guest
+# performance and is therefore recommended
+#viridian = 1
+
+# Initial memory allocation (MB)
+memory = $MEMORY
+
+# Maximum memory (MB)
+# If this is greater than 'memory' then the slack will start ballooned
+# (this assumes guest kernel support for ballooning)
+maxmem = $MAX_MEMORY
+
+# Number of VCPUS
+vcpus = $VCPUS
+
+# Network devices
+# A list of 'vifspec' entries as described in
+# docs/misc/xl-network-configuration.markdown
+vif = [ $INTERFACES ]
+
+# Disk Devices
+# A list of 'diskspec' entries as described in
+# docs/misc/xl-disk-configuration.txt
+disk = [ $DISKS ]
+
+# Disable VNC
+vnc = 0
+EOF
+}
+
 getInterfaceAttribute() {
-    ATTRIBUTE=$(xmllint --xpath '/topology/interfaces/interface['"$1"']/@'"$2"'' $FILE 2>/dev/null \
-            | sed 's/.*'"$2"'="\(.*\)".*/\1/')
+    xmllint --xpath '/topology/interfaces/interface['"$1"']/@'"$2"'' $FILE 2>/dev/null \
+            | sed 's/.*'"$2"'="\(.*\)".*/\1/'
+}
+
+getVMAttribute() {
+    xmllint --xpath '/topology/vms/vm['"$1"']/@'"$2"'' $FILE 2>/dev/null \
+            | sed 's/.*'"$2"'="\(.*\)".*/\1/'
 }
 
 bridgeCleanup() {
@@ -34,21 +97,16 @@ switchCleanup() {
 
 bridge() {
     i="$1"
-    getInterfaceAttribute $i "name"
-    NAME="$ATTRIBUTE"
+    NAME=$(getInterfaceAttribute $i "name")
     if [[ "$NAME" == "" ]]; then
         echo "!! No interface name" 1>&2
         exit 1
     fi
-    getInterfaceAttribute $i "phys"
-    PHYS="$ATTRIBUTE"
+    PHYS=$(getInterfaceAttribute $i "phys")
     if [[ "$IS_DHCP" == "" ]]; then
-        getInterfaceAttribute $i "ip"
-        IP="$ATTRIBUTE"
-        getInterfaceAttribute $i "gateway"
-        GATEWAY="$ATTRIBUTE"
-        getInterfaceAttribute $i "dns"
-        DNS="$ATTRIBUTE"
+        IP=$(getInterfaceAttribute $i "ip")
+        GATEWAY=$(getInterfaceAttribute $i "gateway")
+        DNS=$(getInterfaceAttribute $i "dns")
         create-bridge "$NAME" "$PHYS" "$IP" "$GATEWAY" "$DNS"
     else
         create-bridge "$NAME" "$PHYS"
@@ -57,11 +115,9 @@ bridge() {
 
 switch() {
     i="$1"
-    getInterfaceAttribute $i "name"
-    NAME="$ATTRIBUTE"
+    NAME=$(getInterfaceAttribute $i "name")
     ovs-vsctl add-br "$NAME"
-    getInterfaceAttribute $i "phys"
-    PHYS="$ATTRIBUTE"
+    PHYS=$(getInterfaceAttribute $i "phys")
     for phy in $PHYS; do
         ovs-vsctl add-port "$NAME" "$phy"
     done
@@ -82,8 +138,7 @@ switchCleanup
 echo "--- CREATING INTERFACES ---"
 
 for i in $(seq $NBINTERFACES); do
-    getInterfaceAttribute $i "type"
-    TYPE="$ATTRIBUTE"
+    TYPE=$(getInterfaceAttribute $i "type")
     case $TYPE in
         bridge)
             bridge "$i"
@@ -98,5 +153,23 @@ for i in $(seq $NBINTERFACES); do
     esac
 done
 
-echo "--- CREATING VMS ---"
+echo "--- SETTING VMS UP ---"
 
+for i in $(seq $NBVMS); do
+    continue
+done
+
+echo "Waiting for VMS completion, this might take a while"
+
+while [ "$(xl list | wc -l)" -ne 2 ]; do
+    sleep 1
+done
+
+echo "--- GENERATING VMS ---"
+
+for i in $(seq $NBVMS); do
+    NAME=$(getVMAttribute $i "domainName")
+    RAM=$(getVMAttribute $i "ram")
+    MAXRAM=$(getVMAttribute $i "maxRam")
+    VCPUS=$(getVMAttribute $i "vcpus")
+done
