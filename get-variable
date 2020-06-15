@@ -1,0 +1,15 @@
+#!/bin/sh
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo usage: get-variable NAME
+    exit 1
+fi
+
+NAME="$1"
+
+xenstore-read /local/domain/$(xenstore-read domid)/"$NAME"
