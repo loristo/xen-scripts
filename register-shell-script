@@ -5,12 +5,18 @@ if [ "$UID" -ne 0 ]; then
     exit 1
 fi
 
-if [ "$#" -ne 2 ]; then
-    echo usage: register-shell-script DOMAIN SCRIPT
+if [ "$#" -ne 2 ] || [ "$#" -ne 3 ]; then
+    echo usage: register-shell-script DOMAIN SCRIPT [ NAME ]
     exit 1
 fi
 
 DOMAIN="$1"
 SCRIPT="$2"
 
-xenstore-write /local/domain/$(get-dom-id $DOMAIN)/script "$(cat $SCRIPT)"
+if [ "$#" -eq 3 ]; then
+    NAME="$3"
+else
+    NAME="script"
+fi
+
+xenstore-write /local/domain/$(get-dom-id $DOMAIN)/"$NAME" "$(cat $SCRIPT)"
