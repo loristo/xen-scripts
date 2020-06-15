@@ -1,0 +1,33 @@
+#!/bin/sh
+
+set -e
+
+if [ "$UID" -ne 0 ]; then
+    echo run as root
+    exit 1
+fi
+
+if [ "$#" -ne 1 ] && [ "$#" -ne 4 ]; then
+    echo usage: configure-dhcp name [ ip default-gateway dns ]
+    exit 1
+fi
+
+NAME="$1"
+
+sed -i '/'"$NAME"'/d' /etc/dhcpcd.conf
+
+if [ "$#" -ne 2 ]; then
+    IP="$3"
+    GATEWAY="$4"
+    DNS="$5"
+    cat >> /etc/dhcpcd.conf <<EOF
+# define static route $NAME
+interface $NAME # $NAME
+static ip_address=$IP # $NAME
+static routers=$GATEWAY # $NAME
+static domain_name_servers=$DNS # $NAME
+EOF
+fi
+
+systemctl enable "dhcpcd@$NAME"
+systemctl start "dhcpcd@$NAME"
