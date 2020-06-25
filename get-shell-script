@@ -5,17 +5,13 @@ if [ "$UID" -ne 0 ]; then
     exit 1
 fi
 
-if [ "$#" -gt 1 ]; then
-    echo usage: get-shell-script [ script-name ]
+if [ "$#" -ne 1 ]; then
+    echo usage: get-shell-script NAME
     exit 1
 fi
 
-if [ "$#" -eq 1 ]; then
-    NAME="$1"
-else
-    NAME="script"
-fi
-
+NAME="$1"
 
 xenstore-read /local/domain/$(xenstore-read domid)/"$NAME" \
-    | sed 's/\\n/\n/g' > "$NAME" && chmod 755 "$NAME"
+    | sed 's/\\n/\n/g' \
+    | sed 's/\\t/\t/g' > "$NAME" && chmod 755 "$NAME"
