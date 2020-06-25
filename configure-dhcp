@@ -16,10 +16,10 @@ NAME="$1"
 
 sed -i '/'"$NAME"'/d' /etc/dhcpcd.conf
 
-if [ "$#" -ne 2 ]; then
-    IP="$3"
-    GATEWAY="$4"
-    DNS="$5"
+if [ "$#" -ne 1 ]; then
+    IP="$2"
+    GATEWAY="$3"
+    DNS="$4"
     cat >> /etc/dhcpcd.conf <<EOF
 # define static route $NAME
 interface $NAME # $NAME
