@@ -20,54 +20,69 @@ generateVM() {
     INTERFACES="$5"
     DISKS="$6"
     cat <<EOF
-# =====================================================================
-# $NAME HVM guest configuration
-# =====================================================================
-#
-# This is a fairly minimal example of what is required for an
-# HVM guest. For a more complete guide see xl.cfg(5)
-
-# This configures an HVM rather than PV guest
 type = "hvm"
 builder = "hvm"
-
-# Guest name
 name = "$NAME"
-
-# 128-bit UUID for the domain as a hexadecimal number.
-# Use "uuidgen" to generate one if required.
-# The default behavior is to generate a new UUID each time the guest is started.
-#uuid = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
-
-# Enable Microsoft Hyper-V compatibile paravirtualisation /
-# enlightenment interfaces. Turning this on can improve Windows guest
-# performance and is therefore recommended
-#viridian = 1
-
-# Initial memory allocation (MB)
 memory = $MEMORY
-
-# Maximum memory (MB)
-# If this is greater than 'memory' then the slack will start ballooned
-# (this assumes guest kernel support for ballooning)
 maxmem = $MAX_MEMORY
-
-# Number of VCPUS
 vcpus = $VCPUS
-
-# Network devices
-# A list of 'vifspec' entries as described in
-# docs/misc/xl-network-configuration.markdown
 vif = [ $INTERFACES ]
-
-# Disk Devices
-# A list of 'diskspec' entries as described in
-# docs/misc/xl-disk-configuration.txt
-disk = [ $DISKS ]
-
-# Disable VNC
-vnc = 0
+disk = [
+$DISKS
+]
+vnc = 1
+vncdisplay = 1
+vnclisten = '0.0.0.0'
+vncpasswd= 'Coucou0;'
 EOF
+}
+
+generateInterfaces() {
+    VM="$1"
+    NBINTERFACES=$(xmllint --xpath "count(/topology/vms/vm[$VM]/interfaces/interface)" $FILE)
+    RES=""
+    for i in $(seq $NBINTERFACES); do
+        IP="$(getVMInterfaceAttribute "$VM" "$i" "ip" | sed 's/\(.*\)\/.*/\1/')"
+        TO="$(getVMInterfaceAttribute "$VM" "$i" "to")"
+        RES="$RES"$(if [ "$i" -ne 1 ]; then printf ", "; fi)"'ip=$IP,bridge=$TO'"
+    done
+    echo $RES
+}
+
+generateSetupDisks() {
+    NAME="$1"
+    cat <<EOF
+    'format=raw, vdev=hdc, access=ro, devtype=cdrom, target=/home/master/iso/slow-arch.iso',
+    'format=raw, vdev=xvda, access=rw, target=/dev/vg0/$NAME-disk'
+EOF
+}
+
+configureInterfaces() {
+    local i
+    VM="$1"
+    NAME="$2"
+    NBINTERFACES=$(xmllint --xpath "count(/topology/vms/vm[$VM]/interfaces/interface)" $FILE)
+    printf "#!/bin/sh\n\n"
+    for i in $(seq $NBINTERFACES); do
+        DHCP="$(getVMInterfaceAttribute "$VM" "$i" "dhcp")"
+        if [[ "$DHCP" != "yes" ]]; then
+            INTERFACE="eth$(($i - 1))"
+            IP="$(getVMInterfaceAttribute "$VM" "$i" "ip")"
+            GATEWAY="$(getVMInterfaceAttribute "$VM" "$i" "gateway")"
+            DNS="$(getVMInterfaceAttribute "$VM" "$i" "dns")"
+            cat <<EOF
+sed '/$(echo $IP | sed 's/\(.*\)\/.*/\1/')/d' /etc/hosts -i
+configure-dhcp "$INTERFACE" "$IP" "$GATEWAY" "$DNS"
+echo '$(echo $IP | sed 's/\(.*\)\/.*/\1/')	$NAME.local	localhost' >> /etc/hosts
+EOF
+        else
+            cat <<EOF
+sed '/127\.0\.1\.1/d' /etc/hosts -i
+configure-dhcp "$INTERFACE"
+echo '127.0.1.1	$NAME.local	localhost' >> /etc/hosts
+EOF
+        fi
+    done
 }
 
 getInterfaceAttribute() {
@@ -80,13 +95,10 @@ getVMAttribute() {
             | sed 's/.*'"$2"'="\(.*\)".*/\1/'
 }
 
-bridgeCleanup() {
-    for bridge in $(ls /etc/netctl/bridge-* 2>/dev/null); do
-        B="$(echo "$bridge" | sed 's/.*\/bridge-\(.*\)/\1/')"
-        systemctl disable "dhcpcd@$B"
-        netctl disable "bridge-$B"
-        rm "$bridge"
-    done
+getVMInterfaceAttribute() {
+    xmllint --xpath '/topology/vms/vm['"$1"']/interfaces/interface['"$2"']/@'"$3"'' \
+        $FILE 2>/dev/null \
+        | sed 's/.*'"$3"'="\(.*\)".*/\1/'
 }
 
 switchCleanup() {
@@ -95,32 +107,38 @@ switchCleanup() {
     done
 }
 
-bridge() {
+dhcpcdCleanup() {
+    for dhcp in $(ls ls /etc/systemd/system/multi-user.target.wants/dhcpcd@* 2>/dev/null); do
+        B="$(echo "$dhcp" | sed 's/.*\/\(dhcpcd@.*\.service\)/\1/')"
+        systemctl stop "$B"
+        systemctl disable "$B"
+    done
+}
+
+switch() {
     i="$1"
     NAME=$(getInterfaceAttribute $i "name")
     if [[ "$NAME" == "" ]]; then
         echo "!! No interface name" 1>&2
         exit 1
     fi
-    PHYS=$(getInterfaceAttribute $i "phys")
-    if [[ "$IS_DHCP" == "" ]]; then
-        IP=$(getInterfaceAttribute $i "ip")
-        GATEWAY=$(getInterfaceAttribute $i "gateway")
-        DNS=$(getInterfaceAttribute $i "dns")
-        create-bridge "$NAME" "$PHYS" "$IP" "$GATEWAY" "$DNS"
-    else
-        create-bridge "$NAME" "$PHYS"
-    fi
-}
-
-switch() {
-    i="$1"
-    NAME=$(getInterfaceAttribute $i "name")
     ovs-vsctl add-br "$NAME"
     PHYS=$(getInterfaceAttribute $i "phys")
     for phy in $PHYS; do
         ovs-vsctl add-port "$NAME" "$phy"
     done
+    CONNECT=$(getInterfaceAttribute $i "connect")
+    DHCP=$(getInterfaceAttribute $i "dhcp")
+    if [[ "$CONNECT" == "yes" ]]; then
+        if [[ "$DHCP" != "yes" ]]; then
+            IP=$(getInterfaceAttribute $i "ip")
+            GATEWAY=$(getInterfaceAttribute $i "gateway")
+            DNS=$(getInterfaceAttribute $i "dns")
+            configure-dhcp "$NAME" "$IP" "$GATEWAY" "$DNS"
+        else
+            configure-dhcp "$NAME"
+        fi
+    fi
 }
 
 FILE="$1"
@@ -132,31 +150,43 @@ echo "- VMS: $NBVMS"
 echo
 
 echo "--- CLEANING INTERFACES ---"
-bridgeCleanup
-switchCleanup
+#switchCleanup
+#dhcpcdCleanup
+echo
 
 echo "--- CREATING INTERFACES ---"
 
 for i in $(seq $NBINTERFACES); do
-    TYPE=$(getInterfaceAttribute $i "type")
-    case $TYPE in
-        bridge)
-            bridge "$i"
-            ;;
-        switch)
-            switch "$i"
-            ;;
-        *)
-            echo "!! Unknown interface type: $TYPE" 1>&2
-            exit 1
-            ;;
-    esac
+    #switch "$i"
+    continue
 done
 
+echo
+
+echo "--- CLEANING VMS ---"
+
+for disk in $(ls /dev/vg0); do
+    remove-disk $(echo $disk | sed 's/\(.*\)-disk/\1/')
+done
+
+echo
 echo "--- SETTING VMS UP ---"
 
+mkdir -p /tmp/vm-gen/
+
 for i in $(seq $NBVMS); do
-    continue
+    NAME="$(getVMAttribute $i "domainName")"
+    RAM=$(getVMAttribute $i "ram")
+    MAXRAM=$(getVMAttribute $i "maxRam")
+    VCPUS=$(getVMAttribute $i "vcpus")
+    INTERFACES=$(generateInterfaces $i)
+    DISKS=$(generateSetupDisks $NAME)
+    create-disk $NAME "$(getVMAttribute $i "disk")"
+    cat << EOF > "/tmp/vm-gen/$NAME"
+$(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
+EOF
+    xl create "/tmp/vm-gen/$NAME"
+    register-shell-script "$NAME" "interface-script" <<<$(configureInterfaces $i $NAME)
 done
 
 echo "Waiting for VMS completion, this might take a while"
@@ -165,11 +195,16 @@ while [ "$(xl list | wc -l)" -ne 2 ]; do
     sleep 1
 done
 
-echo "--- GENERATING VMS ---"
+echo
+echo "--- STARTING VMS ---"
 
 for i in $(seq $NBVMS); do
-    NAME=$(getVMAttribute $i "domainName")
-    RAM=$(getVMAttribute $i "ram")
-    MAXRAM=$(getVMAttribute $i "maxRam")
-    VCPUS=$(getVMAttribute $i "vcpus")
+    continue #TODO
+done
+
+echo
+echo "--- ENABLING VMS ---"
+
+for i in $(seq $NBVMS); do
+    continue #TODO
 done
