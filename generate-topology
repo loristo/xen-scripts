@@ -30,10 +30,7 @@ vif = [ $INTERFACES ]
 disk = [
 $DISKS
 ]
-vnc = 1
-vncdisplay = 1
-vnclisten = '0.0.0.0'
-vncpasswd= 'Coucou0;'
+vnc = 0
 EOF
 }
 
@@ -53,6 +50,13 @@ generateSetupDisks() {
     NAME="$1"
     cat <<EOF
     'format=raw, vdev=hdc, access=ro, devtype=cdrom, target=/home/master/iso/slow-arch.iso',
+    'format=raw, vdev=xvda, access=rw, target=/dev/vg0/$NAME-disk'
+EOF
+}
+
+generateDisks() {
+    NAME="$1"
+    cat <<EOF
     'format=raw, vdev=xvda, access=rw, target=/dev/vg0/$NAME-disk'
 EOF
 }
@@ -152,7 +156,13 @@ echo
 echo "--- CLEANING INTERFACES ---"
 #switchCleanup
 #dhcpcdCleanup
-echo
+
+echo "--- CLEANING VMS ---"
+for i in $(seq $NBVMS); do
+    NAME="$(getVMAttribute $i "domainName")"
+    xl list "$NAME" >/dev/null && xl destroy "$NAME"
+done
+rm -f /etc/xen/auto/*
 
 echo "--- CREATING INTERFACES ---"
 
@@ -161,17 +171,7 @@ for i in $(seq $NBINTERFACES); do
     continue
 done
 
-echo
-
-echo "--- CLEANING VMS ---"
-
-for disk in $(ls /dev/vg0); do
-    remove-disk $(echo $disk | sed 's/\(.*\)-disk/\1/')
-done
-
-echo
 echo "--- SETTING VMS UP ---"
-
 mkdir -p /tmp/vm-gen/
 
 for i in $(seq $NBVMS); do
@@ -181,11 +181,13 @@ for i in $(seq $NBVMS); do
     VCPUS=$(getVMAttribute $i "vcpus")
     INTERFACES=$(generateInterfaces $i)
     DISKS=$(generateSetupDisks $NAME)
-    create-disk $NAME "$(getVMAttribute $i "disk")"
-    cat << EOF > "/tmp/vm-gen/$NAME"
+    ! ( [ -L "/dev/vg0/$NAME-disk" ] && [ -e "/dev/vg0/$NAME-disk" ] ) \
+        && create-disk $NAME "$(getVMAttribute $i "disk")"
+    cat > "/tmp/vm-gen/$NAME-gen.hvm" << EOF
 $(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
+boot="d"
 EOF
-    xl create "/tmp/vm-gen/$NAME"
+    xl create "/tmp/vm-gen/$NAME-gen.hvm"
     register-shell-script "$NAME" "interface-script" <<<$(configureInterfaces $i $NAME)
 done
 
@@ -195,16 +197,29 @@ while [ "$(xl list | wc -l)" -ne 2 ]; do
     sleep 1
 done
 
-echo
 echo "--- STARTING VMS ---"
 
 for i in $(seq $NBVMS); do
-    continue #TODO
+    NAME="$(getVMAttribute $i "domainName")"
+    RAM=$(getVMAttribute $i "ram")
+    MAXRAM=$(getVMAttribute $i "maxRam")
+    VCPUS=$(getVMAttribute $i "vcpus")
+    INTERFACES=$(generateInterfaces $i)
+    DISKS=$(generateDisks $NAME)
+    cat > "$NAME.hvm" << EOF
+$(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
+boot="c"
+EOF
+    xl create "$NAME.hvm"
 done
 
-echo
 echo "--- ENABLING VMS ---"
 
 for i in $(seq $NBVMS); do
-    continue #TODO
+    NAME="$(getVMAttribute $i "domainName")"
+    ln -s "$PWD/$NAME.hvm" "/etc/xen/auto/$NAME.hvm"
 done
+
+echo "--- CREATING ANSIBLE FILES ---"
+
+mkdir -p ansible
