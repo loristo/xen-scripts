@@ -12,6 +12,104 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
+FILE="$1"
+
+main() {
+    NBINTERFACES=$(xmllint --xpath "count(/topology/interfaces/interface)" $FILE)
+    NBVMS=$(xmllint --xpath "count(/topology/vms/vm)" $FILE)
+    DOMAIN=$(xmllint --xpath '/topology/@domain'"$2"'' $FILE 2>/dev/null \
+        | sed 's/.*'"$2"'="\(.*\)".*/\1/')
+
+    if [ -z "$DOMAIN" ]; then
+        DOMAIN="local"
+    else
+        sed '/'"$DOMAIN"'/d' -i /etc/hosts
+    fi
+
+    echo "- Domain: $DOMAIN"
+    echo "- Interfaces: $NBINTERFACES"
+    echo "- VMS: $NBVMS"
+    echo
+
+    cat >>/etc/hosts <<EOF
+$(generateHosts)
+EOF
+
+    echo "--- CLEANING INTERFACES ---"
+    switchCleanup
+    dhcpcdCleanup
+
+    echo "--- CLEANING VMS ---"
+    for i in $(seq $NBVMS); do
+        NAME="$(getVMAttribute "$i" "domainName")"
+        xl list "$NAME" >/dev/null && xl destroy "$NAME"
+    done
+    rm -f /etc/xen/auto/*
+
+    echo "--- CREATING INTERFACES ---"
+
+    for i in $(seq $NBINTERFACES); do
+        switch "$i"
+        continue
+    done
+
+    echo "--- SETTING VMS UP ---"
+    mkdir -p /tmp/vm-gen/
+
+    for i in $(seq $NBVMS); do
+        NAME="$(getVMAttribute $i "domainName")"
+        RAM=$(getVMAttribute $i "ram")
+        MAXRAM=$(getVMAttribute $i "maxRam")
+        VCPUS=$(getVMAttribute $i "vcpus")
+        INTERFACES=$(generateInterfaces $i)
+        DISKS=$(generateSetupDisks $NAME)
+        ! ( [ -L "/dev/vg0/$NAME-disk" ] && [ -e "/dev/vg0/$NAME-disk" ] ) \
+            && create-disk $NAME "$(getVMAttribute $i "disk")"
+        cat > "/tmp/vm-gen/$NAME-gen.hvm" << EOF
+$(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
+boot="d"
+EOF
+        xl create "/tmp/vm-gen/$NAME-gen.hvm"
+        register-shell-script "$NAME" "interface-script" <<<$(configureInterfaces $i $NAME)
+    done
+
+    echo "Waiting for VMS completion, this might take a while"
+
+    while [ "$(xl list | wc -l)" -ne 2 ]; do
+        sleep 1
+    done
+
+    echo "--- STARTING VMS ---"
+
+    mkdir -p hvms
+
+    for i in $(seq $NBVMS); do
+        NAME="$(getVMAttribute $i "domainName")"
+        RAM=$(getVMAttribute $i "ram")
+        MAXRAM=$(getVMAttribute $i "maxRam")
+        VCPUS=$(getVMAttribute $i "vcpus")
+        INTERFACES=$(generateInterfaces $i)
+        DISKS=$(generateDisks $NAME)
+        cat > "hvms/$NAME.hvm" << EOF
+$(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
+boot="c"
+EOF
+        xl create "hvms/$NAME.hvm"
+    done
+
+    echo "--- ENABLING VMS ---"
+
+    for i in $(seq $NBVMS); do
+        NAME="$(getVMAttribute $i "domainName")"
+        ln "$PWD/hvms/$NAME.hvm" "/etc/xen/auto/$NAME.hvm"
+    done
+
+    echo "--- CREATING ANSIBLE FILES ---"
+
+    mkdir -p ansible
+    generateAnsibleHosts
+}
+
 generateVM() {
     local NAME MEMORY MAXRAM VCPUS INTERFACES DISKS
     NAME="$1"
@@ -161,7 +259,8 @@ EOF
 }
 
 generateAnsibleHosts() {
-    local STACK VISITED VMINTERFACES TO NAME VM VMS INTERFACE HOSTS CHILDREN curr
+    local STACK VISITED VMINTERFACES TO NAME VM VMS INTERFACE HOSTS CHILDREN \
+        IP ACCESS key curr
 
     declare -A ansibleHostsAccess
     declare -A ansibleHostsInterfacesVMS
@@ -169,9 +268,11 @@ generateAnsibleHosts() {
     STACK=""
 
     # Filling stack with accessible interfaces from host
-    for i in $(seq $NBINTERFACES); do
-        if [[ "$(getInterfaceAttribute "$i" "connect")" == "yes" ]]; then
-            STACK="$(push "$STACK" "$(getInterfaceAttribute "$i" "name")")"
+    for INTERFACE in $(seq $NBINTERFACES); do
+        NAME="$(getInterfaceAttribute "$INTERFACE" "name")"
+        if [[ "$(getInterfaceAttribute "$INTERFACE" "connect")" == "yes" ]]; then
+            STACK="$(push "$STACK" "$NAME")"
+            ansibleHostsAccess["$NAME"]=""
         fi
     done
 
@@ -238,10 +339,23 @@ EOF
             VMINTERFACES=$(getVMInterfaces $VM)
             for INTERFACE in $(seq "$VMINTERFACES"); do
                 TO="$(getVMInterfaceAttribute "$VM" "$INTERFACE" "to")"
+                if [[ "$curr" == "$TO" ]]; then
+                    IP="$(getVMInterfaceAttribute "$VM" "$INTERFACE" "ip" \
+                        | sed 's/\(.*\)\/.*/\1/')"
+                fi
+            done
+            for INTERFACE in $(seq "$VMINTERFACES"); do
+                TO="$(getVMInterfaceAttribute "$VM" "$INTERFACE" "to")"
                 [[ "$curr" == "$TO" ]] && continue
                 if ! instack "$VISITED" "$TO"; then
                     STACK="$(push "$STACK" "$TO")"
                     VISITED="$(push "$VISITED" "$TO")"
+                    ACCESS="${ansibleHostsAccess["$TO"]}"
+                    if [ -z "$ACCESS" ]; then
+                        ansibleHostsAccess["$TO"]="$IP"
+                    else
+                        ansibleHostsAccess["$TO"]="$ACCESS,$IP"
+                    fi
                 fi
             done
         done
@@ -259,6 +373,18 @@ EOF
             cat >>ansible/hosts <<EOF
       children:
 $CHILDREN
+EOF
+        fi
+    done
+
+    mkdir -p ansible/group_vars
+
+    for key in "${!ansibleHostsAccess[@]}"; do
+        ACCESS="${ansibleHostsAccess["$key"]}"
+        if ! [ -z "$ACCESS" ]; then
+            cat >"ansible/group_vars/$key.yml" <<EOF
+---
+ansible_ssh_common_args: '-J $ACCESS'
 EOF
         fi
     done
@@ -303,98 +429,4 @@ dhcpcdCleanup() {
     done
 }
 
-FILE="$1"
-NBINTERFACES=$(xmllint --xpath "count(/topology/interfaces/interface)" $FILE)
-NBVMS=$(xmllint --xpath "count(/topology/vms/vm)" $FILE)
-DOMAIN=$(xmllint --xpath '/topology/@domain'"$2"'' $FILE 2>/dev/null \
-    | sed 's/.*'"$2"'="\(.*\)".*/\1/')
-
-if [ -z "$DOMAIN" ]; then
-    DOMAIN="local"
-else
-    sed '/'"$DOMAIN"'/d' -i /etc/hosts
-fi
-
-echo "- Domain: $DOMAIN"
-echo "- Interfaces: $NBINTERFACES"
-echo "- VMS: $NBVMS"
-echo
-
-cat >>/etc/hosts <<EOF
-$(generateHosts)
-EOF
-
-echo "--- CLEANING INTERFACES ---"
-switchCleanup
-dhcpcdCleanup
-
-echo "--- CLEANING VMS ---"
-for i in $(seq $NBVMS); do
-    NAME="$(getVMAttribute "$i" "domainName")"
-    xl list "$NAME" >/dev/null && xl destroy "$NAME"
-done
-rm -f /etc/xen/auto/*
-
-echo "--- CREATING INTERFACES ---"
-
-for i in $(seq $NBINTERFACES); do
-    switch "$i"
-    continue
-done
-
-echo "--- SETTING VMS UP ---"
-mkdir -p /tmp/vm-gen/
-
-for i in $(seq $NBVMS); do
-    NAME="$(getVMAttribute $i "domainName")"
-    RAM=$(getVMAttribute $i "ram")
-    MAXRAM=$(getVMAttribute $i "maxRam")
-    VCPUS=$(getVMAttribute $i "vcpus")
-    INTERFACES=$(generateInterfaces $i)
-    DISKS=$(generateSetupDisks $NAME)
-    ! ( [ -L "/dev/vg0/$NAME-disk" ] && [ -e "/dev/vg0/$NAME-disk" ] ) \
-        && create-disk $NAME "$(getVMAttribute $i "disk")"
-    cat > "/tmp/vm-gen/$NAME-gen.hvm" << EOF
-$(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
-boot="d"
-EOF
-    xl create "/tmp/vm-gen/$NAME-gen.hvm"
-    register-shell-script "$NAME" "interface-script" <<<$(configureInterfaces $i $NAME)
-done
-
-echo "Waiting for VMS completion, this might take a while"
-
-while [ "$(xl list | wc -l)" -ne 2 ]; do
-    sleep 1
-done
-
-echo "--- STARTING VMS ---"
-
-mkdir -p hvms
-
-for i in $(seq $NBVMS); do
-    NAME="$(getVMAttribute $i "domainName")"
-    RAM=$(getVMAttribute $i "ram")
-    MAXRAM=$(getVMAttribute $i "maxRam")
-    VCPUS=$(getVMAttribute $i "vcpus")
-    INTERFACES=$(generateInterfaces $i)
-    DISKS=$(generateDisks $NAME)
-    cat > "hvms/$NAME.hvm" << EOF
-$(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
-boot="c"
-EOF
-    xl create "hvms/$NAME.hvm"
-done
-
-echo "--- ENABLING VMS ---"
-
-for i in $(seq $NBVMS); do
-    NAME="$(getVMAttribute $i "domainName")"
-    ln "$PWD/hvms/$NAME.hvm" "/etc/xen/auto/$NAME.hvm"
-done
-
-echo "--- CREATING ANSIBLE FILES ---"
-
-mkdir -p ansible
-generateAnsibleHosts
-exit
+main
