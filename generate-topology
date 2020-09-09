@@ -13,6 +13,7 @@ if [ "$#" -ne 1 ]; then
 fi
 
 generateVM() {
+    local NAME MEMORY MAXRAM VCPUS INTERFACES DISKS
     NAME="$1"
     MEMORY="$2"
     MAX_MEMORY="$3"
@@ -34,11 +35,28 @@ vnc = 0
 EOF
 }
 
+push() {
+    printf "$2$(! [ -z "$1" ] && printf " ")$1"
+}
+
+laststack() {
+    grep -oE '[^ ]+$' <<<"$1" || ( ! [ -z "$1" ] && printf " " )
+}
+
+pop() {
+    sed 's/\( \|^\)'"$(laststack "$1")"'$//' <<<"$1"
+}
+
+instack() {
+    [[ "$1" =~ (^| )$2($| ) ]]
+}
+
 generateInterfaces() {
+    local VMINTERFACES i VM RES IP TO
     VM="$1"
-    NBINTERFACES=$(xmllint --xpath "count(/topology/vms/vm[$VM]/interfaces/interface)" $FILE)
+    VMINTERFACES=$(getVMInterfaces $VM)
     RES=""
-    for i in $(seq $NBINTERFACES); do
+    for i in $(seq $VMINTERFACES); do
         IP="$(getVMInterfaceAttribute "$VM" "$i" "ip" | sed 's/\(.*\)\/.*/\1/')"
         TO="$(getVMInterfaceAttribute "$VM" "$i" "to")"
         RES="$RES"$(if [ "$i" -ne 1 ]; then printf ", "; fi)"'ip=$IP,bridge=$TO'"
@@ -47,6 +65,7 @@ generateInterfaces() {
 }
 
 generateSetupDisks() {
+    local NAME
     NAME="$1"
     cat <<EOF
     'format=raw, vdev=hdc, access=ro, devtype=cdrom, target=/home/master/iso/slow-arch.iso',
@@ -55,6 +74,7 @@ EOF
 }
 
 generateDisks() {
+    local NAME
     NAME="$1"
     cat <<EOF
     'format=raw, vdev=xvda, access=rw, target=/dev/vg0/$NAME-disk'
@@ -62,12 +82,12 @@ EOF
 }
 
 configureInterfaces() {
-    local i
+    local i VM NAME VMINTERFACES DHCP IP GATEWAY DNS
     VM="$1"
     NAME="$2"
-    NBINTERFACES=$(xmllint --xpath "count(/topology/vms/vm[$VM]/interfaces/interface)" $FILE)
+    VMINTERFACES=$(getVMInterfaces $VM)
     printf "#!/bin/sh\n\n"
-    for i in $(seq $NBINTERFACES); do
+    for i in $(seq $VMINTERFACES); do
         DHCP="$(getVMInterfaceAttribute "$VM" "$i" "dhcp")"
         if [[ "$DHCP" != "yes" ]]; then
             INTERFACE="eth$(($i - 1))"
@@ -87,39 +107,16 @@ echo '127.0.1.1	$NAME.local	localhost' >> /etc/hosts
 EOF
         fi
     done
-}
+    cat <<EOF
+cat >>/etc/hosts <<ENDHOST
 
-getInterfaceAttribute() {
-    xmllint --xpath '/topology/interfaces/interface['"$1"']/@'"$2"'' $FILE 2>/dev/null \
-            | sed 's/.*'"$2"'="\(.*\)".*/\1/'
-}
-
-getVMAttribute() {
-    xmllint --xpath '/topology/vms/vm['"$1"']/@'"$2"'' $FILE 2>/dev/null \
-            | sed 's/.*'"$2"'="\(.*\)".*/\1/'
-}
-
-getVMInterfaceAttribute() {
-    xmllint --xpath '/topology/vms/vm['"$1"']/interfaces/interface['"$2"']/@'"$3"'' \
-        $FILE 2>/dev/null \
-        | sed 's/.*'"$3"'="\(.*\)".*/\1/'
-}
-
-switchCleanup() {
-    for switch in $(sudo ovs-vsctl show | grep Bridge | sed 's/.*Bridge \(.*\)/\1/'); do
-        ovs-vsctl del-br "$switch"
-    done
-}
-
-dhcpcdCleanup() {
-    for dhcp in $(ls ls /etc/systemd/system/multi-user.target.wants/dhcpcd@* 2>/dev/null); do
-        B="$(echo "$dhcp" | sed 's/.*\/\(dhcpcd@.*\.service\)/\1/')"
-        systemctl stop "$B"
-        systemctl disable "$B"
-    done
+$(generateHosts)
+ENDHOST
+EOF
 }
 
 switch() {
+    local i NAME PHYS phy CONNECT DHCP IP GATEWAY DNS
     i="$1"
     NAME=$(getInterfaceAttribute $i "name")
     if [[ "$NAME" == "" ]]; then
@@ -145,21 +142,195 @@ switch() {
     fi
 }
 
+generateHosts() {
+    local i VM NAME VMINTERFACES DHCP IP GATEWAY DNS
+    for VM in $(seq $NBVMS); do
+        NAME="$(getVMAttribute "$VM" domainName)"
+        VMINTERFACES=$(getVMInterfaces $VM)
+        for i in $(seq $VMINTERFACES); do
+            DHCP="$(getVMInterfaceAttribute "$VM" "$i" "dhcp")"
+            if [[ "$DHCP" != "yes" ]]; then
+                IP="$(getVMInterfaceAttribute "$VM" "$i" "ip" \
+                    | sed 's/\(.*\)\/.*/\1/')"
+                cat <<EOF
+$IP	$NAME.$DOMAIN
+EOF
+            fi
+        done
+    done
+}
+
+generateAnsibleHosts() {
+    local STACK VISITED VMINTERFACES TO NAME VM VMS INTERFACE HOSTS CHILDREN curr
+
+    declare -A ansibleHostsAccess
+    declare -A ansibleHostsInterfacesVMS
+
+    STACK=""
+
+    # Filling stack with accessible interfaces from host
+    for i in $(seq $NBINTERFACES); do
+        if [[ "$(getInterfaceAttribute "$i" "connect")" == "yes" ]]; then
+            STACK="$(push "$STACK" "$(getInterfaceAttribute "$i" "name")")"
+        fi
+    done
+
+    VISITED="$STACK"
+
+    # Filling VMS per interfaces
+    for VM in $(seq "$NBVMS"); do
+        VMINTERFACES=$(getVMInterfaces $VM)
+        for INTERFACE in $(seq "$VMINTERFACES"); do
+            TO="$(getVMInterfaceAttribute "$VM" "$INTERFACE" "to")"
+            ansibleHostsInterfacesVMS[$TO]="$(push \
+                "${ansibleHostsInterfacesVMS[$TO]}" \
+                "$VM")"
+        done
+    done
+
+    cat >ansible/hosts <<EOF
+all:
+  children:
+EOF
+
+    VMS=""
+    # Creating hosts file
+    while ! [ -z "$STACK" ]; do
+        curr="$(laststack "$STACK")"
+        HOSTS=""
+        CHILDREN=""
+
+        for VM in ${ansibleHostsInterfacesVMS[$curr]}; do
+            NAME="$(getVMAttribute "$VM" domainName)"
+            if ! instack "$VMS" "$NAME"; then
+                VMS="$(push "$VMS" "$NAME")"
+                if ! [ -z "$CHILDREN" ]; then
+                    CHILDREN="$(cat <<EOF
+$CHILDREN
+        $NAME:
+          hosts:
+            $NAME.$DOMAIN:
+EOF
+                    )"
+                else
+                    CHILDREN="$(cat <<EOF
+        $NAME:
+          hosts:
+            $NAME.$DOMAIN:
+EOF
+                    )"
+                fi
+            else
+                if ! [ -z "$HOSTS" ]; then
+                    HOSTS="$(cat <<EOF
+$HOSTS
+        $NAME.$DOMAIN:
+EOF
+                    )"
+                else
+                    HOSTS="$(cat <<EOF
+        $NAME.$DOMAIN:
+EOF
+                    )"
+
+                fi
+            fi
+            VMINTERFACES=$(getVMInterfaces $VM)
+            for INTERFACE in $(seq "$VMINTERFACES"); do
+                TO="$(getVMInterfaceAttribute "$VM" "$INTERFACE" "to")"
+                [[ "$curr" == "$TO" ]] && continue
+                if ! instack "$VISITED" "$TO"; then
+                    STACK="$(push "$STACK" "$TO")"
+                    VISITED="$(push "$VISITED" "$TO")"
+                fi
+            done
+        done
+        STACK="$(pop "$STACK")"
+        cat >>ansible/hosts <<EOF
+    $curr:
+EOF
+        if ! [ -z "$HOSTS" ]; then
+            cat >>ansible/hosts <<EOF
+      hosts:
+$HOSTS
+EOF
+        fi
+        if ! [ -z "$CHILDREN" ]; then
+            cat >>ansible/hosts <<EOF
+      children:
+$CHILDREN
+EOF
+        fi
+    done
+
+    unset ansibleHostsAccess
+    unset ansibleHostsInterfacesVMS
+}
+
+getInterfaceAttribute() {
+    xmllint --xpath '/topology/interfaces/interface['"$1"']/@'"$2"'' $FILE 2>/dev/null \
+            | sed 's/.*'"$2"'="\(.*\)".*/\1/'
+}
+
+getVMAttribute() {
+    xmllint --xpath '/topology/vms/vm['"$1"']/@'"$2"'' $FILE 2>/dev/null \
+            | sed 's/.*'"$2"'="\(.*\)".*/\1/'
+}
+
+getVMInterfaces() {
+    xmllint --xpath "count(/topology/vms/vm[$1]/interfaces/interface)" $FILE
+}
+
+getVMInterfaceAttribute() {
+    xmllint --xpath '/topology/vms/vm['"$1"']/interfaces/interface['"$2"']/@'"$3"'' \
+        $FILE 2>/dev/null \
+        | sed 's/.*'"$3"'="\(.*\)".*/\1/'
+}
+
+switchCleanup() {
+    local switch
+    for switch in $(sudo ovs-vsctl show | grep Bridge | sed 's/.*Bridge \(.*\)/\1/'); do
+        ovs-vsctl del-br "$switch"
+    done
+}
+
+dhcpcdCleanup() {
+    local dhcp B
+    for dhcp in $(ls ls /etc/systemd/system/multi-user.target.wants/dhcpcd@* 2>/dev/null); do
+        B="$(echo "$dhcp" | sed 's/.*\/\(dhcpcd@.*\.service\)/\1/')"
+        systemctl stop "$B"
+        systemctl disable "$B"
+    done
+}
+
 FILE="$1"
 NBINTERFACES=$(xmllint --xpath "count(/topology/interfaces/interface)" $FILE)
 NBVMS=$(xmllint --xpath "count(/topology/vms/vm)" $FILE)
+DOMAIN=$(xmllint --xpath '/topology/@domain'"$2"'' $FILE 2>/dev/null \
+    | sed 's/.*'"$2"'="\(.*\)".*/\1/')
 
+if [ -z "$DOMAIN" ]; then
+    DOMAIN="local"
+else
+    sed '/'"$DOMAIN"'/d' -i /etc/hosts
+fi
+
+echo "- Domain: $DOMAIN"
 echo "- Interfaces: $NBINTERFACES"
 echo "- VMS: $NBVMS"
 echo
 
+cat >>/etc/hosts <<EOF
+$(generateHosts)
+EOF
+
 echo "--- CLEANING INTERFACES ---"
-#switchCleanup
-#dhcpcdCleanup
+switchCleanup
+dhcpcdCleanup
 
 echo "--- CLEANING VMS ---"
 for i in $(seq $NBVMS); do
-    NAME="$(getVMAttribute $i "domainName")"
+    NAME="$(getVMAttribute "$i" "domainName")"
     xl list "$NAME" >/dev/null && xl destroy "$NAME"
 done
 rm -f /etc/xen/auto/*
@@ -167,7 +338,7 @@ rm -f /etc/xen/auto/*
 echo "--- CREATING INTERFACES ---"
 
 for i in $(seq $NBINTERFACES); do
-    #switch "$i"
+    switch "$i"
     continue
 done
 
@@ -199,6 +370,8 @@ done
 
 echo "--- STARTING VMS ---"
 
+mkdir -p hvms
+
 for i in $(seq $NBVMS); do
     NAME="$(getVMAttribute $i "domainName")"
     RAM=$(getVMAttribute $i "ram")
@@ -206,20 +379,22 @@ for i in $(seq $NBVMS); do
     VCPUS=$(getVMAttribute $i "vcpus")
     INTERFACES=$(generateInterfaces $i)
     DISKS=$(generateDisks $NAME)
-    cat > "$NAME.hvm" << EOF
+    cat > "hvms/$NAME.hvm" << EOF
 $(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
 boot="c"
 EOF
-    xl create "$NAME.hvm"
+    xl create "hvms/$NAME.hvm"
 done
 
 echo "--- ENABLING VMS ---"
 
 for i in $(seq $NBVMS); do
     NAME="$(getVMAttribute $i "domainName")"
-    ln -s "$PWD/$NAME.hvm" "/etc/xen/auto/$NAME.hvm"
+    ln "$PWD/hvms/$NAME.hvm" "/etc/xen/auto/$NAME.hvm"
 done
 
 echo "--- CREATING ANSIBLE FILES ---"
 
 mkdir -p ansible
+generateAnsibleHosts
+exit
