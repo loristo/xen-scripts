@@ -7,8 +7,8 @@ if [ "$UID" -ne 0 ]; then
     exit 1
 fi
 
-if [ "$#" -ne 1 ] && [ "$#" -ne 4 ]; then
-    echo usage: configure-dhcp name [ ip default-gateway dns ]
+if [ "$#" -ne 1 ] && [ "$#" -ne 4 ] && [ "$#" -ne 5 ]; then
+    echo usage: configure-dhcp name [ ip default-gateway dns [ ip6 ] ]
     exit 1
 fi
 
@@ -24,6 +24,14 @@ if [ "$#" -ne 1 ]; then
 # define static route $NAME
 interface $NAME # $NAME
 static ip_address=$IP # $NAME
+EOF
+    IP6="$5"
+    if ! [ -z "$IP6" ]; then
+        cat >> /etc/dhcpcd.conf <<EOF
+static ip6_address=$IP6 # $NAME
+EOF
+    fi
+    cat >> /etc/dhcpcd.conf <<EOF
 static routers=$GATEWAY # $NAME
 static domain_name_servers=$DNS # $NAME
 EOF
