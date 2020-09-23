@@ -17,8 +17,11 @@ FILE="$1"
 main() {
     NBINTERFACES=$(xmllint --xpath "count(/topology/interfaces/interface)" $FILE)
     NBVMS=$(xmllint --xpath "count(/topology/vms/vm)" $FILE)
-    DOMAIN=$(xmllint --xpath '/topology/@domain'"$2"'' $FILE 2>/dev/null \
-        | sed 's/.*'"$2"'="\(.*\)".*/\1/')
+    DOMAIN=$(xmllint --xpath '/topology/@domain' $FILE 2>/dev/null \
+        | sed 's/.*="\(.*\)".*/\1/')
+    IPV6SUBNET=$(xmllint --xpath '/topology/@ipv6subnet' $FILE 2>/dev/null \
+        | sed 's/.*="\(.*\)".*/\1/')
+    MACS=""
 
     if [ -z "$DOMAIN" ]; then
         DOMAIN="local"
@@ -42,7 +45,7 @@ EOF
     echo "--- CLEANING VMS ---"
     for i in $(seq $NBVMS); do
         NAME="$(getVMAttribute "$i" "domainName")"
-        xl list "$NAME" >/dev/null && xl destroy "$NAME"
+        xl list "$NAME" >/dev/null && xl destroy "$NAME" 2>/dev/null
     done
     rm -f /etc/xen/auto/*
 
@@ -101,7 +104,7 @@ EOF
 
     for i in $(seq $NBVMS); do
         NAME="$(getVMAttribute $i "domainName")"
-        ln "$PWD/hvms/$NAME.hvm" "/etc/xen/auto/$NAME.hvm"
+        ln -s "$PWD/hvms/$NAME.hvm" "/etc/xen/auto/$NAME.hvm"
     done
 
     echo "--- CREATING ANSIBLE FILES ---"
@@ -149,15 +152,39 @@ instack() {
     [[ "$1" =~ (^| )$2($| ) ]]
 }
 
+generateMac() {
+    local seed
+    seed="$1"
+
+    printf "00:16:3e:%02x:%02x:%02x" \
+        $(python -c "
+import random;
+random.seed('$seed');
+print('{:n} {:n} {:n}'
+    .format(random.randrange(256),
+            random.randrange(256),
+            random.randrange(256)))
+            ")
+}
+
 generateInterfaces() {
-    local VMINTERFACES i VM RES IP TO
+    local VMINTERFACES i changer VM RES IP TO MAC
     VM="$1"
     VMINTERFACES=$(getVMInterfaces $VM)
     RES=""
     for i in $(seq $VMINTERFACES); do
         IP="$(getVMInterfaceAttribute "$VM" "$i" "ip" | sed 's/\(.*\)\/.*/\1/')"
         TO="$(getVMInterfaceAttribute "$VM" "$i" "to")"
-        RES="$RES"$(if [ "$i" -ne 1 ]; then printf ", "; fi)"'ip=$IP,bridge=$TO'"
+        changer="0"
+        while true; do
+            MAC=$(generateMac "$(getVMAttribute "$VM" "name")$i$changer")
+            if ! instack "$MACS" "$MAC"; then
+                MACS="$(push "$MACS" "$MAC")"
+                break
+            fi
+            changer=$((changer + 1))
+        done
+        RES="$RES"$(if [ "$i" -ne 1 ]; then printf ", "; fi)"'mac=$MAC,ip=$IP,bridge=$TO'"
     done
     echo $RES
 }
@@ -180,7 +207,7 @@ EOF
 }
 
 configureInterfaces() {
-    local i VM NAME VMINTERFACES DHCP IP GATEWAY DNS
+    local i VM NAME VMINTERFACES DHCP IP GATEWAY DNS IPV6MASK CIDR IPV6
     VM="$1"
     NAME="$2"
     VMINTERFACES=$(getVMInterfaces $VM)
@@ -192,9 +219,13 @@ configureInterfaces() {
             IP="$(getVMInterfaceAttribute "$VM" "$i" "ip")"
             GATEWAY="$(getVMInterfaceAttribute "$VM" "$i" "gateway")"
             DNS="$(getVMInterfaceAttribute "$VM" "$i" "dns")"
+            IPV6MASK="$(getVMInterfaceAttribute "$VM" "$i" "ipv6mask")"
+            CIDR=$(echo $IPV6MASK | sed 's/.*\/\(.*\)/\1/')
+            IPV6MASK=$(echo $IPV6MASK | sed 's/\(.*\)\/.*/\1/')
+            IPV6="$(generateIPv6 $IPV6MASK)/$CIDR"
             cat <<EOF
 sed '/$(echo $IP | sed 's/\(.*\)\/.*/\1/')/d' /etc/hosts -i
-configure-dhcp "$INTERFACE" "$IP" "$GATEWAY" "$DNS"
+configure-dhcp "$INTERFACE" "$IP" "$GATEWAY" "$DNS" "$IPV6"
 echo '$(echo $IP | sed 's/\(.*\)\/.*/\1/')	$NAME.local	localhost' >> /etc/hosts
 EOF
         else
@@ -225,19 +256,36 @@ switch() {
     PHYS=$(getInterfaceAttribute $i "phys")
     for phy in $PHYS; do
         ovs-vsctl add-port "$NAME" "$phy"
+        continue
     done
     CONNECT=$(getInterfaceAttribute $i "connect")
-    DHCP=$(getInterfaceAttribute $i "dhcp")
     if [[ "$CONNECT" == "yes" ]]; then
+        DHCP=$(getInterfaceAttribute $i "dhcp")
         if [[ "$DHCP" != "yes" ]]; then
             IP=$(getInterfaceAttribute $i "ip")
             GATEWAY=$(getInterfaceAttribute $i "gateway")
             DNS=$(getInterfaceAttribute $i "dns")
-            configure-dhcp "$NAME" "$IP" "$GATEWAY" "$DNS"
+            IPV6MASK=$(getInterfaceAttribute $i "ipv6mask")
+            CIDR=$(echo $IPV6MASK | sed 's/.*\/\(.*\)/\1/')
+            IPV6MASK=$(echo $IPV6MASK | sed 's/\(.*\)\/.*/\1/')
+            IPV6="$(generateIPv6 $IPV6MASK)/$CIDR"
+            configure-dhcp "$NAME" "$IP" "$GATEWAY" "$DNS" "$IPV6"
         else
             configure-dhcp "$NAME"
         fi
     fi
+}
+
+generateIPv6() {
+    local IPV6MASK
+    IPV6MASK="$1"
+    python -c \
+        "import ipaddress; \
+        network = ipaddress.ip_network('$IPV6SUBNET'); \
+        ip = ipaddress.ip_address('$IPV6MASK'); \
+        print(ipaddress.ip_address(int.from_bytes(network.network_address.packed, 'big') \
+            | (int.from_bytes(ip.packed, 'big') \
+            & int.from_bytes(network.hostmask.packed, 'big'))).compressed)"
 }
 
 generateHosts() {
