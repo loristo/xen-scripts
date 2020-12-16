@@ -21,7 +21,6 @@ main() {
         | sed 's/.*="\(.*\)".*/\1/')
     IPV6SUBNET=$(xmllint --xpath '/topology/@ipv6subnet' $FILE 2>/dev/null \
         | sed 's/.*="\(.*\)".*/\1/')
-    MACS=""
 
     if [ -z "$DOMAIN" ]; then
         DOMAIN="local"
@@ -38,16 +37,13 @@ main() {
 $(generateHosts)
 EOF
 
+    echo "--- CLEANING VMS ---"
+    removeVMS
+    rm -f /etc/xen/auto/*
+
     echo "--- CLEANING INTERFACES ---"
     switchCleanup
     dhcpcdCleanup
-
-    echo "--- CLEANING VMS ---"
-    for i in $(seq $NBVMS); do
-        NAME="$(getVMAttribute "$i" "domainName")"
-        xl list "$NAME" >/dev/null && xl destroy "$NAME" 2>/dev/null
-    done
-    rm -f /etc/xen/auto/*
 
     echo "--- CREATING INTERFACES ---"
 
@@ -65,21 +61,24 @@ EOF
         MAXRAM=$(getVMAttribute $i "maxRam")
         VCPUS=$(getVMAttribute $i "vcpus")
         INTERFACES=$(generateInterfaces $i)
-        DISKS=$(generateSetupDisks $NAME)
-        ! ( [ -L "/dev/vg0/$NAME-disk" ] && [ -e "/dev/vg0/$NAME-disk" ] ) \
-            && create-disk $NAME "$(getVMAttribute $i "disk")"
+        DISKS="$(generateSetupDisks "$i" "$NAME")"
         cat > "/tmp/vm-gen/$NAME-gen.hvm" << EOF
 $(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
 boot="d"
 EOF
         xl create "/tmp/vm-gen/$NAME-gen.hvm"
         register-shell-script "$NAME" "interface-script" <<<$(configureInterfaces $i $NAME)
+        register-shell-script "$NAME" "disks-script" <<<$(configureDisks $i $NAME)
     done
 
     echo "Waiting for VMS completion, this might take a while"
 
+    SECONDS=0
     while [ "$(xl list | wc -l)" -ne 2 ]; do
         sleep 1
+        if [ "$SECONDS" -gt 150 ]; then
+            removeVMS
+        fi
     done
 
     echo "--- STARTING VMS ---"
@@ -92,7 +91,7 @@ EOF
         MAXRAM=$(getVMAttribute $i "maxRam")
         VCPUS=$(getVMAttribute $i "vcpus")
         INTERFACES=$(generateInterfaces $i)
-        DISKS=$(generateDisks $NAME)
+        DISKS="$(generateDisks "$i" "$NAME")"
         cat > "hvms/$NAME.hvm" << EOF
 $(generateVM "$NAME" "$RAM" "$MAXRAM" "$VCPUS" "$INTERFACES" "$DISKS")
 boot="c"
@@ -111,6 +110,13 @@ EOF
 
     mkdir -p ansible
     generateAnsibleHosts
+}
+
+removeVMS() {
+    local NAME
+    for NAME in $(xl list | tail -n+3 | sed 's/ .*//'); do
+        xl destroy "$NAME" 2>/dev/null
+    done
 }
 
 generateVM() {
@@ -175,15 +181,7 @@ generateInterfaces() {
     for i in $(seq $VMINTERFACES); do
         IP="$(getVMInterfaceAttribute "$VM" "$i" "ip" | sed 's/\(.*\)\/.*/\1/')"
         TO="$(getVMInterfaceAttribute "$VM" "$i" "to")"
-        changer="0"
-        while true; do
-            MAC=$(generateMac "$(getVMAttribute "$VM" "name")$i$changer")
-            if ! instack "$MACS" "$MAC"; then
-                MACS="$(push "$MACS" "$MAC")"
-                break
-            fi
-            changer=$((changer + 1))
-        done
+        MAC=$(generateMac "$(getVMAttribute "$VM" "domainName")$i$changer")
         RES="$RES"$(if [ "$i" -ne 1 ]; then printf ", "; fi)"'mac=$MAC,ip=$IP,bridge=$TO'"
     done
     echo $RES
@@ -191,19 +189,95 @@ generateInterfaces() {
 
 generateSetupDisks() {
     local NAME
-    NAME="$1"
+    VM="$1"
+    NAME="$2"
     cat <<EOF
     'format=raw, vdev=hdc, access=ro, devtype=cdrom, target=/home/master/iso/slow-arch.iso',
-    'format=raw, vdev=xvda, access=rw, target=/dev/vg0/$NAME-disk'
 EOF
+    generateDisks "$VM" "$NAME"
+}
+
+generateDiskName() {
+    local NAME MOUNT
+    NAME="$1"
+    MOUNT="$2"
+    if [[ "$MOUNT" == "/" ]]; then
+        echo "$NAME"
+    else
+        echo "$NAME$(echo "$MOUNT" | sed 's/\//-/g' | sed 's/\./--/g')"
+    fi
 }
 
 generateDisks() {
-    local NAME
-    NAME="$1"
-    cat <<EOF
-    'format=raw, vdev=xvda, access=rw, target=/dev/vg0/$NAME-disk'
+    local VM NAME LETTER VMDISKS i VG SIZE MOUNT HASROOT
+    VM="$1"
+    NAME="$2"
+    VMDISKS=$(getVMDisks $VM)
+    LETTER="b"
+    HASROOT=0
+    for i in $(seq $VMDISKS); do
+        VG="$(getVMDiskAttribute "$VM" "$i" "vg")"
+        SIZE="$(getVMDiskAttribute "$VM" "$i" "size")"
+        MOUNT="$(getVMDiskAttribute "$VM" "$i" "mount")"
+        if [[ "$MOUNT" == "/" ]]; then
+            HASROOT=1
+            if ! [ -e "/dev/$VG/$(generateDiskName "$NAME" "$MOUNT")-disk" ]; then
+                create-disk "$(generateDiskName "$NAME" "$MOUNT")" \
+                    "$SIZE" "$VG" 1>/dev/null
+            fi
+            cat <<EOF
+    'format=raw, vdev=sda, access=rw, target=/dev/$VG/$(generateDiskName "$NAME" "$MOUNT")-disk',
 EOF
+        fi
+    done
+    if [ "$HASROOT" -ne 1 ]; then
+        echo "!! No root disk from VM $NAME" 1>&2
+        exit 1
+    fi
+
+    for i in $(seq $VMDISKS); do
+        VG="$(getVMDiskAttribute "$VM" "$i" "vg")"
+        SIZE="$(getVMDiskAttribute "$VM" "$i" "size")"
+        MOUNT="$(getVMDiskAttribute "$VM" "$i" "mount")"
+        if [[ "$MOUNT" != "/" ]]; then
+            if ! [ -e "/dev/$VG/$(generateDiskName "$NAME" "$MOUNT")-disk" ]; then
+                create-disk "$(generateDiskName "$NAME" "$MOUNT")" \
+                    "$SIZE" "$VG" 1>/dev/null
+            fi
+            cat <<EOF
+    'format=raw, vdev=sd$LETTER, access=rw, target=/dev/$VG/$(generateDiskName "$NAME" "$MOUNT")-disk',
+EOF
+            LETTER="$(python -c "print(chr(ord('$LETTER') + 1))")"
+        fi
+    done
+}
+
+configureDisks() {
+    local i LETTER VM NAME VMDISKS VG SIZE MOUNT
+    VM="$1"
+    NAME="$2"
+    VMDISKS=$(getVMDisks $VM)
+    LETTER="b"
+    for i in $(seq $VMDISKS); do
+        MOUNT="$(getVMDiskAttribute "$VM" "$i" "mount")"
+        if [[ "$MOUNT" != "/" ]]; then
+            cat <<EOF
+if ! ( \
+       parted /dev/xvd$LETTER align-check opt 1 \
+    && (parted /dev/xvd$LETTER print | grep '.*ext4.*') \
+); then
+    parted -a optimal -s /dev/xvd$LETTER mklabel gpt || true
+    parted -a optimal -s /dev/xvd$LETTER mkpart root ext4 0% 100% || true
+
+    mkfs.ext4 -F /dev/xvd${LETTER}1
+fi
+
+mkdir -p /mnt$MOUNT
+mount /dev/xvd${LETTER}1 /mnt$MOUNT
+EOF
+            LETTER="$(python -c "print(chr(ord('$LETTER') + 1))")"
+        fi
+    done
 }
 
 configureInterfaces() {
@@ -432,10 +506,45 @@ EOF
         if ! [ -z "$ACCESS" ]; then
             cat >"ansible/group_vars/$key.yml" <<EOF
 ---
-ansible_ssh_common_args: '-J $ACCESS'
+ansible_ssh_common_args: '-o ProxyCommand="ssh -W %h:%p -q $ACCESS"'
 EOF
         fi
     done
+
+    cat >"ansible/group_vars/all.yml" <<EOF
+---
+domain: $DOMAIN
+EOF
+
+    for VM in $(seq $NBVMS); do 
+        VMINTERFACES=$(getVMInterfaces $VM)
+        NAME="$(getVMAttribute "$VM" domainName)"
+        for i in $(seq $VMINTERFACES); do
+            IPV6MASK="$(getVMInterfaceAttribute "$VM" "$i" "ipv6mask")"
+            if [ -z "$IPV6MASK" ]; then
+                continue
+            fi
+            IPV6MASK="$(echo "$IPV6MASK" | sed 's/\(.*\)\/.*/\1/')"
+            cat >>"ansible/group_vars/all.yml" <<EOF
+${NAME}_ipv6: $(generateIPv6 $IPV6MASK)
+EOF
+        break
+        done
+        for i in $(seq $VMINTERFACES); do
+            IP="$(getVMInterfaceAttribute "$VM" "$i" "ip" | sed 's/\(.*\)\/.*/\1/')"
+            if [ -z "$IP" ]; then
+                continue
+            fi
+            cat >>"ansible/group_vars/all.yml" <<EOF
+${NAME}_ip: $IP
+EOF
+        break
+        done
+    done
+
+    cat >>"ansible/group_vars/all.yml" <<EOF
+public_ip: $(curl https://ipinfo.io/ip)
+EOF
 
     unset ansibleHostsAccess
     unset ansibleHostsInterfacesVMS
@@ -455,8 +564,18 @@ getVMInterfaces() {
     xmllint --xpath "count(/topology/vms/vm[$1]/interfaces/interface)" $FILE
 }
 
+getVMDisks() {
+    xmllint --xpath "count(/topology/vms/vm[$1]/disks/disk)" $FILE
+}
+
 getVMInterfaceAttribute() {
     xmllint --xpath '/topology/vms/vm['"$1"']/interfaces/interface['"$2"']/@'"$3"'' \
+        $FILE 2>/dev/null \
+        | sed 's/.*'"$3"'="\(.*\)".*/\1/'
+}
+
+getVMDiskAttribute() {
+    xmllint --xpath '/topology/vms/vm['"$1"']/disks/disk['"$2"']/@'"$3"'' \
         $FILE 2>/dev/null \
         | sed 's/.*'"$3"'="\(.*\)".*/\1/'
 }
