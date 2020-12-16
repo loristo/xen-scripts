@@ -7,9 +7,9 @@ if [ "$UID" -ne 0 ]; then
     exit 1
 fi
 
-if [ "$#" -ne 2 ]; then
-    echo usage: create-disks vm-name disk-size
+if [ "$#" -ne 3 ]; then
+    echo usage: create-disks vm-name disk-size vg
     exit 1
 fi
 
-lvcreate -n "$1-disk"  -L "$2" vg0
+lvcreate -y -n "$1-disk"  -L "$2" "$3"
