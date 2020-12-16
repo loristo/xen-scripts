@@ -27,6 +27,8 @@ static ip_address=$IP # $NAME
 EOF
     IP6="$5"
     if ! [ -z "$IP6" ]; then
+        grep 'ipv6ra_noautoconf' /etc/dhcpcd.conf >/dev/null \
+            || echo 'ipv6ra_noautoconf' >> /etc/dhcpcd.conf
         cat >> /etc/dhcpcd.conf <<EOF
 static ip6_address=$IP6 # $NAME
 EOF
