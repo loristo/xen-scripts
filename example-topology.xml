@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<topology domain="example.com" ipv6subnet="fe80::/64">
+    <interfaces>
+        <interface name="xenbr0"
+            connect="yes"
+            ip="192.168.5.2/24" gateway="192.168.5.1"
+            ipv6mask="::1/64"
+            dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844"
+            phys="eth1 eth2" />
+        <interface name="lan" />
+        <interface name="dmz" />
+    </interfaces>
+    <vms>
+        <vm domainName="router" maxRam="1024" ram="512" vcpus="2" disk="10Gib">
+            <interfaces>
+                <interface to="xenbr0"
+                    ip="192.168.5.3/24" ipv6mask="::2/64"
+                    gateway="192.168.5.1"
+                    dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844" />
+                <interface to="lan"
+                    ip="192.168.6.1/24" ipv6mask="::6:1/64"
+                    gateway="192.168.6.1"
+                    dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844" />
+                <interface to="dmz"
+                    ip="192.168.7.1/24" ipv6mask="::7:1/64"
+                    gateway="192.168.7.1"
+                    dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844" />
+            </interfaces>
+            <disks>
+                <disk mount="/" size="10Gib" vg="vg0" />
+            </disks>
+        </vm>
+        <vm domainName="db" maxRam="1024" ram="512" vcpus="1" disk="10Gib">
+            <interfaces>
+                <interface to="dmz"
+                    ip="192.168.7.2/24" ipv6mask="::7:2/64"
+                    gateway="192.168.7.1"
+                    dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844" />
+            </interfaces>
+            <disks>
+                <disk mount="/" size="10Gib" vg="vg0" />
+                <disk mount="/var/lib/postgres/" size="100Gib" vg="vg1" />
+            </disks>
+        </vm>
+    </vms>
+</topology>
